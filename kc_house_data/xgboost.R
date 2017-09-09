@@ -40,7 +40,7 @@ xgb_train <- xgb.DMatrix(as.matrix(training[,-c(1, 19, 20)]), label = label)
 xgb_test <- xgb.DMatrix(as.matrix(testing[,-1]))
 
 ## 訓練xgb的樹模型
-xtree <- xgboost(data = xgb_train, nrounds = 500, eta = 0.1, max_depth = 4, print_every_n = 50)
+xtree <- xgboost(data = xgb_train, nrounds = 500, eta = 0.1, max_depth = 4)
 pred_tree <- predict(xtree, xgb_test)
 RMSE_tree <- sqrt(mean((testing$price - exp(pred_tree) * testing$sqft_living)^2))
 
