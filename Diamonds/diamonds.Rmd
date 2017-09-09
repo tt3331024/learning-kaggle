@@ -1,0 +1,152 @@
+--- 
+title: "使用xgboost, randomForest 預測 diamonds 的價格" 
+author: "柯則宇" 
+date: "2017年8月28日" 
+output: html_document 
+---
+
+```{r setup, include=FALSE} 
+library(xgboost)
+library(randomForest)
+library(GGally)
+library(ggplot2) 
+library(dplyr) 
+library(doParallel)
+library(foreach)
+```
+
+## Diamonds 資料描述
+
+Diamonds 的資料是 ggplot2 所內建的。共有 53940 比樣本，10 個變項。以下是個變項的說明：  
+carat:鑽石的重量  
+cut:鑽石的切割質量  
+color:鑽石的色彩質量  
+clarity:測量鑽石的清晰度 
+depth:總深度百分比 = z/mean(x, y) = 2*z/(x + y)  
+table:鑽石的頂部相對於最寬點的寬度  
+price:鑽石的美金價格  
+x:鑽石的長度  
+y:鑽石的寬度  
+z:鑽石的高度
+
+首先先將資料分成 50% 的訓練資料和 50% 的測試資料。
+
+```{r} 
+.d <- diamonds
+set.seed(770312)
+sample_ID <- sample(nrow(.d), 0.5*nrow(.d)) 
+train_data <- .d[sample_ID,] 
+test_data <- .d[-sample_ID,] 
+rm(.d) 
+```
+
+檢視測試資料
+
+```{r} 
+str(train_data) 
+summary(train_data) 
+```
+
+由於在 x, y, z 中有和 depth 不相符的部分，因此我們刪除 x, y, z，只留下 depth。  
+並用這六個變項繪製兩兩個關係圖。
+
+```{r, fig.width = 10, fig.height = 10, warning=F, message=F}
+ggpairs(train_data[1:7])
+```
+
+可以看到 price 是具有右偏的趨勢，且和 carat 呈現高度正相關。  
+至於 price 在個等級的 cut, color, clarity 上，有許多離群值。  
+高偏態的目標變項如果使用線性模型做預測，會有很大的誤差，因此下面都是使用樹模型來做預測。
+
+## xgboost
+建立 xgboost 可用的資料格式，須將 data.frame 轉成 matrix。  
+可透過 `xgb.DMatrix()` 將資料拆分為預測變項和目標變項。
+
+```{r} 
+xgb_train_data <- data.matrix(train_data[,1:6]) %>% 
+                  xgb.DMatrix(label = train_data$price) 
+xgb_test_data <- data.matrix(test_data[,1:6]) %>% 
+                 xgb.DMatrix(label = test_data$price) 
+```
+
+我們將學習速率設為 0.05。
+由於變項並不多，因此樹最大分支量限定為 4。  
+隨機選取 2/3 的變項，而每棵樹隨機選取的建模樣本則抽取 80%。  
+最後，我們共迭代 300 次。
+
+```{r} 
+set.seed(770312)
+x <- xgb.train(data = xgb_train_data, nrounds = 300, 
+               eta = 0.05, max_depth = 4, 
+               colsample_bytree = 0.66, subsample = 0.8, 
+               watchlist = list(train = xgb_train_data),
+               print_every_n = 50
+              )
+```
+
+## 預測變項的重要程度
+
+檢視各變項的重要程度:
+
+```{r} 
+xgb.importance(colnames(train_data[,1:6]), x) 
+```
+
+從 importance table 看到，在 6 個預測變項中，carat 的 Gain 值最高，代表是最重要的因子。  
+此外也可以透過綜合樹圖的 Gain 值，看出各變項的重要程度：
+
+```{r, fig.width = 10, fig.height = 10} 
+xgb.plot.multi.trees(x, colnames(train_data[,1:6])) 
+```
+
+最後，我們將該模型套用在測試資料上，來看預測結果的 RMSE：
+
+```{r} 
+pred_xgb <- predict(x, xgb_test_data)
+sqrt(mean((test_data$price - pred_xgb)^2))
+```
+
+## Random Forest
+在隨機森林模型中，一樣使用六個解釋變項來預測目標變項。  
+其中，特徵選取使用預設值，每棵樹隨機選取 2 個的特徵來生長。  
+共訓練 300 棵樹來組成森林。
+然而考慮到效率問題，我們使用 `foreach` 和 `doParallel` 來進行平行化運算。  
+首先啟動叢集(cluster)，並使用 `makeCluster` 和 `registerDoParallel` 把它 設定成暫存器(register)。並在完成所有事後，用 `sotpCluster` 將叢集終止。  
+`ntree = rep(150, 2)` 代表有兩個叢集，每個叢及訓練 150 棵樹。  
+`.combine`是合併的方法，這邊是使用 `randomForest` 的 `combine` 函式來合併。  
+在 `.packages` 指定每個叢集都需再入 `randomForest`，以增進運算過程。  
+運算子 `%dopar%` 可讓 `foreach` 以平行運算的方式執行。
+可以從[ foreach 官方文件](https://cran.r-project.org/web/packages/foreach/foreach.pdf)看到更多說明。  
+
+```{r}
+set.seed(770312)
+# 使用2個核心運算並設定暫存器
+cl <- makeCluster(2)
+registerDoParallel(cl)
+# 平行化運算
+rf <- foreach(ntree = rep(150, 2), .combine = randomForest::combine, .packages = 'randomForest') %dopar%
+  randomForest(price ~ carat + cut + color + clarity + depth + table, data = train_data, ntree = ntree, importance = T)
+# 關閉暫存器
+stopCluster(cl)
+rf
+```
+
+可以從結果中看到隨機森林模型是用 300 棵樹做訓練，且每顆樹是由兩個特徵所生成。  
+但是根據 `?randomForest::combine` 說明：  
+The confusion, err.rate, mse and rsq components (as well as the corresponding components in the test compnent, if exist) of the combined object will be NULL.  
+所以 MSE 和 rsq 等訊息都會消失，只能直接使用測試資料來測試。  
+接著來看rf model中，因子的重要程度表：
+
+```{r}
+importance(rf)
+```
+
+透過每棵樹平均下降的 MSE，可以看到 carat 平均下降程度最大，代表 carat 是最重要的因子，這點和 xgboost 一樣。  
+最後，我們將隨機森林模型套用在測試資料上，來看預測結果的 RMSE：
+
+```{r}
+pred_rf <- predict(rf, test_data)
+sqrt(mean((test_data$price - pred_rf)^2))
+```
+
+以上就是使用 xgboost 和 randomForest 來對 diamonds 資料建模進行預測。
